@@ -54,13 +54,17 @@ input.num{
   border:2px solid var(--ink); padding:5px 8px;
 }
 
-#loading{
-  position:fixed; top:10px; right:10px;
-  font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
-  background:var(--bone); border:2px solid var(--ink); padding:5px 8px;
+/* Streamer.bot connection label (the chat box's): bottom centre, 24px up. Figma's 8px
+   stroke is centred on the frame, so half of it eats into the 14px padding and the
+   other half hangs 4px outside: the frame is 24px up, so the border box is 20px. Its
+   16px radius is on that centre line too, so the outer edge is 20 (and the inside 12). */
+#connectionLabel{
+  position:fixed; left:50%; bottom:20px; transform:translateX(-50%);
+  z-index:2;
+  padding:10px;
+  background:var(--bone); border:8px solid var(--ink); border-radius:20px;
+  font-family:"Inter", sans-serif; font-size:24px; line-height:29px; font-weight:600;
+  color:var(--ink); white-space:nowrap;
+  transition:opacity 350ms ease;
 }
-#loading[hidden]{ display:none; }
-/* Hard gate: nothing may paint this bar over the stream. The loader note and any
-   asset error are diagnostics — without ?debug they only ever reach the console,
-   and this rule makes that true even if some code path unhides the element. */
-body:not(.debug) #loading{ display:none !important; }
+#connectionLabel.hidden{ opacity:0; }

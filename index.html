@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Eseninocafe — Multichat Stingers</title>
-<link rel="stylesheet" href="style.css?v=2">
+<!-- The Inter build Figma uses, for the connection label -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@4.5.15/600.css">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 
@@ -31,12 +33,9 @@
   <span class="tag" id="bitCount">bits: 0</span>
 </div>
 
-<!-- hidden by default so nothing shows on stream; revealed only with ?debug (asset errors go to the console, never on screen) -->
-<div id="loading" hidden>loading assets…</div>
-
 <script src="assets/vendor/matter.min.js"></script>
 <script src="assets/collision.js?v=2"></script>
 <script type="text/javascript" src="https://unpkg.com/@streamerbot/client/dist/streamerbot-client.js"></script>
-<script src="script.js?v=2"></script>
+<script src="script.js?v=3"></script>
 </body>
 </html>

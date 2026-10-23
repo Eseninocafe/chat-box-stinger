@@ -1307,6 +1307,21 @@ function triggerStinger(kind, effect){
   }
 }
 
+// The label at the bottom (the chat box's): NOT CONNECTED until Streamer.bot connects,
+// then CONNECTED for a moment before it fades. Built here rather than in index.html,
+// so a cached old page paired with this script can't break it.
+const connectionLabel = document.createElement('div');
+connectionLabel.id = 'connectionLabel';
+connectionLabel.textContent = 'NOT CONNECTED';
+document.body.appendChild(connectionLabel);
+let connectionHideTimer = 0;
+function setConnectionStatus(connected){
+  clearTimeout(connectionHideTimer);
+  connectionLabel.textContent = connected ? 'CONNECTED' : 'NOT CONNECTED';
+  connectionLabel.classList.remove('hidden');
+  if(connected) connectionHideTimer = setTimeout(() => connectionLabel.classList.add('hidden'), 2000);
+}
+
 /* =========================================================================
    Streamer.bot connection
    Uses the official @streamerbot/client (loaded in index.html). It connects
@@ -1340,8 +1355,8 @@ function connectStreamerbot(){
   const client = new StreamerbotClient({
     host: address,
     port: port,
-    onConnect: () => console.log('[stinger] connected to Streamer.bot'),
-    onDisconnect: () => console.log('[stinger] disconnected from Streamer.bot — retrying…'),
+    onConnect: () => setConnectionStatus(true),
+    onDisconnect: () => setConnectionStatus(false),
   });
 
   // Cheer -> tiered bit gems in the tip jar (delayed so the chat fades out first)
@@ -1408,23 +1423,15 @@ function wireHud(){
 
 (async ()=>{
   const params = new URLSearchParams(location.search);
-  // Only surface the "loading assets…" note while debugging — on stream it must stay
-  // invisible (OBS reloads the source on scene changes, and a routine loader flashing
-  // each time looks broken). Errors go to the console for the same reason: a red bar
-  // burned into the stream is worse than the missing frame it's reporting, and the
-  // loader already retries and patches over the frames it couldn't get.
-  if(params.has('debug')){ document.body.classList.add('debug'); $('loading').hidden = false; }
+  // Asset errors go to the console only: a red bar burned into the stream is worse
+  // than the missing frame it's reporting, and the loader already retries and
+  // patches over the frames it couldn't get.
   try{
     await loadAssets();
   }catch(err){
     console.error('[assets] ' + err.message);
-    if(params.has('debug')){
-      $('loading').hidden = false;
-      $('loading').textContent = 'asset error: ' + err.message;
-    }
     return;
   }
-  $('loading').hidden = true;
 
   bakeAssets();          // pre-rasterize every SVG frame/sprite so OBS isn't re-rasterizing them each frame
   buildSmoothedBoxes();
