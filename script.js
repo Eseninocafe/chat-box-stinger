@@ -3,9 +3,22 @@
    Eseninocafe multichat stingers
    - tip-jar stinger : intro + persistent bit gems + arc bit throws
    - sub-stinger     : full-screen frame sequence @ 25fps
-   - donation-stinger: same player, enabled once frames exist in
-                       assets/donation-stinger/donation-stinger.00.svg …
+   - donation-stinger: same player — the paper bag, for Streamlabs donations,
+                       StreamElements tips and YouTube Super Chats (cheers go to the
+                       tip jar; YouTube memberships to the sub stinger). compact: Blender
+                       frames; normal: drawn live in code with the donation's receipt
+                       taped on (assets/normal/donation-stinger)
+   - raid-bell       : same player — the bell's intro, then one click per raider
+                       (up to CFG.raidMaxClicks)
    Trigger API: window.stinger  (also driven live by Streamer.bot, see bottom)
+
+   Two variants, picked in index.html from the browser-source size:
+   - compact (400x400): falling-jar intro, SVG-frame sub stinger, raid bell
+                        animated in Blender (fill added at load)
+   - normal  (596x596): static jar and raid bell that fade in, webm sub stinger,
+                        ground, throw arcs drawn on the jar art; the bell is two
+                        parts and its button is pressed in code
+   Both use the v7 physics prototype's gem-outline bodies and thick walls.
    ========================================================================= */
 
 const { Engine, Bodies, Body, Composite, Sleeping } = Matter;
@@ -14,7 +27,6 @@ const { Engine, Bodies, Body, Composite, Sleeping } = Matter;
 const CFG = {
   fps: 25,                 // frame sequences play at 25fps
   gemSize: 72,             // settled gem size (design-space px, scaled via MAP)
-  overlap: 0.4,            // physics radius shrink 0–0.5
   defaultBits: 20,         // demo fill amount
   maxJarGems: 30,          // physical jar capacity — oldest gems culled beyond this
   maxQueuedThrows: 40,     // big cheers get clamped to this many visible throws
@@ -46,15 +58,34 @@ const CFG = {
   subFrames: 65,
   waitBeforeFadeMs: 800,
   fadeOutMs: 400,
-  subFadeInMs: 250,        // sub/dono stinger eases in instead of popping
+  subFadeInMs: 250,        // sub/dono/raid stinger eases in instead of popping
+  raidMaxClicks: 10,       // the raid bell clicks once per raider, at most this many times
+  raidPauseFrames: 8,      // the bell rests this many frames (0.32s at 25fps) before the first click
+  raidNoteFrame: 3,        // which frame of each click (0-6) sends up its music note: 3 = button fully down
+  // gem bodies and walls (the v7 physics prototype's model, both variants)
+  gemBounds: 0.85,         // gem body = the sprite's stroke outline scaled by this
+  wallThick: { compact: 20, normal: 28 },   // jar wall bodies grow this far inward from the drawn line (px)
+  // normal variant only
+  jarFadeInMs: 400,        // the static jar fades in over this (compact fades over its first 3 fall frames)
+  noteScale: 0.7,          // music-note size; 0.7 matches compact's notes relative to the canvas
 };
 
-const TIP_FILL   = i => `assets/tip-jar-stinger/fill/tip-jar.${pad2(i)}.svg`;
-const TIP_STROKE = i => `assets/tip-jar-stinger/stroke/tip-jar.${pad2(i)}.svg`;
-const SUB_FRAME  = i => `assets/sub-stinger/sub-stinger.${pad2(i)}.svg`;
-const DONO_FRAME = i => `assets/donation-stinger/donation-stinger.${pad2(i)}.svg`;
+const NORMAL = window.VARIANT === 'normal';
+const A = `assets/${NORMAL ? 'normal' : 'compact'}`;
+// normal has one static jar frame; it's both the back and the front (multiply) pass, see loop()
+const TIP_FILL   = NORMAL ? ()=>`${A}/tip-jar-stinger/tip-jar.svg` : i => `${A}/tip-jar-stinger/fill/tip-jar.${pad2(i)}.svg`;
+const TIP_STROKE = NORMAL ? TIP_FILL : i => `${A}/tip-jar-stinger/stroke/tip-jar.${pad2(i)}.svg`;
+const SUB_FRAME  = i => `${A}/sub-stinger/sub-stinger.${pad2(i)}.svg`;
+const SUB_VIDEO  = `${A}/sub-stinger/sub-stinger-animation.webm`;
+const RAID_INTRO = `${A}/raid-bell-stinger/intro.svg`;     // compact: Blender animations
+const RAID_CLICK = `${A}/raid-bell-stinger/click.svg`;
+const RAID_BODY   = `${A}/raid-bell-stinger/bell-body.svg`;    // normal: two filled parts
+const RAID_BUTTON = `${A}/raid-bell-stinger/bell-button.svg`;
+const DONO_DIR   = `${A}/donation-stinger`;
+const DONO_SVG   = `${DONO_DIR}/paper-bag-stinger.svg`;   // compact: the paper bag's frames, for donations/tips
+const NOTE_URLS  = [`${A}/music-eighth-note.svg`, `${A}/music-quaver-note.svg`];
 const GEM_COLORS = ['red','blue','green','purple','gray'];
-const GEM_URLS = GEM_COLORS.map(c => `assets/gems/bit-${c}.svg`);
+const GEM_URLS = GEM_COLORS.map(c => NORMAL ? `assets/gems/bit-${c}.svg` : `${A}/bit-${c}.svg`);
 let gemByColor = {};   // color -> loaded image, filled in loadAssets
 
 const collision = window.TIPJAR_COLLISION;
@@ -65,9 +96,19 @@ const W = collision.meta.sourceWidth, H = collision.meta.sourceHeight;
    original 500x650 mocks (bit-throw-structure.svg / music-effect.svg). The
    animation canvas can change (now 400x400) — everything is anchored to the
    jar's final backBox, so the authored geometry follows the art automatically. */
-const DESIGN = { bbBottomCenter:[252.25, 324.285], bbW:340.9, subBottomY:650 };
+const DESIGN = { bbBottomCenter:[252.25, 324.285], bbW:340.9, subBottomY:650, noteStartY:254 };
+// design space laid over a box (canvas px): spanning its width, the note arcs starting
+// at its top — as in the v7 prototype. Used for the front-on jar and the raid bell.
+const overBox = b => { const s = b.w/DESIGN.bbW;
+  return { s, dx: b.x + b.w/2 - DESIGN.bbBottomCenter[0]*s, dy: b.y - DESIGN.noteStartY*s }; };
 const MAP = (()=>{
-  const bb = collision.frames[collision.frames.length-1].backBox;
+  const last = collision.frames[collision.frames.length-1], bb = last.backBox;
+  if(!bb){
+    // no back box (the front-on normal jar): over the walls' box
+    const pts = last.wallSegments.flat();
+    const minX = Math.min(...pts.map(p=>p[0]))*W, maxX = Math.max(...pts.map(p=>p[0]))*W;
+    return overBox({ x: minX, y: Math.min(...pts.map(p=>p[1]))*H, w: maxX-minX });
+  }
   const s = (bb.w*W)/DESIGN.bbW;
   return { s,
     dx: bb.cx*W - DESIGN.bbBottomCenter[0]*s,
@@ -75,9 +116,11 @@ const MAP = (()=>{
 })();
 const mapPt = p => [p[0]*MAP.s+MAP.dx, p[1]*MAP.s+MAP.dy];
 
-let GEM = Math.round(CFG.gemSize*MAP.s), OVERLAP = CFG.overlap;
+let GEM = NORMAL ? CFG.gemSize : Math.round(CFG.gemSize*MAP.s);
+const BODY = CFG.gemBounds;   // physics body size as a fraction of GEM
 
-const WALL_T = 16;
+// wall bodies fill the band from the drawn line to WALL_T inside it
+const WALL_T = CFG.wallThick[NORMAL ? 'normal' : 'compact'];
 const LIVE = { frictionAir:.002, restitution:.15 };
 
 /* =========================================================================
@@ -100,12 +143,14 @@ const THROW = {
   shrinkEnd: 0.75,                 // fraction of flight where size reaches GEM
 };
 
-// music-note arcs (from music-effect.svg, design space): notes float up-outward
-const mapArc = a => ({ P0:mapPt(a.P0), P1:mapPt(a.P1), P2:mapPt(a.P2), P3:mapPt(a.P3) });
-const NOTE_ARCS = {
-  right: mapArc({ P0:[353,254],   P1:[367.5,192.502], P2:[418.5,155.002], P3:[442.5,148.502] }),
-  left:  mapArc({ P0:[151.5,254], P1:[137,192.502],   P2:[86,155.002],    P3:[62,148.502]    }),
-};
+// music-note arcs (from music-effect.svg, design space): notes float up-outward.
+// noteArcs(m) places them with a design-space -> canvas mapper.
+const noteArcs = m => ({
+  right: { P0:m([353,254]),   P1:m([367.5,192.502]), P2:m([418.5,155.002]), P3:m([442.5,148.502]) },
+  left:  { P0:m([151.5,254]), P1:m([137,192.502]),   P2:m([86,155.002]),    P3:m([62,148.502])    },
+});
+const NOTE_ARCS = noteArcs(mapPt);      // over the tip jar
+let raidNoteArcs = null;                // over the raid bell, set once its art loads
 
 function pad2(i){ return String(i).padStart(2,'0'); }
 const lerp = (a,b,f)=>a+(b-a)*f;
@@ -115,7 +160,20 @@ const smooth = t => t*t*(3-2*t);                // smoothstep
 function lag(u, s){ return s[0]*(2*u-1)*(u-1) + s[1]*4*u*(1-u) + s[2]*u*(2*u-1); }
 function lagPt(u, pts){ return [lag(u, pts.map(p=>p[0])), lag(u, pts.map(p=>p[1]))]; }
 
+// normal: the three throw arcs (left / center / right) drawn on the v7 jar art,
+// in canvas px, spawn end first; blended over u like the compact samples
+const NORMAL_THROWS = [
+  [[107,406.283], [124.5,70.7831], [221,19.7834],   [246.5,244.783]],
+  [[297,428.5],   [292.5,115],     [294,-34.2166],  [292.5,244.783]],
+  [[486,406.283], [468.5,70.7827], [372,19.7829],   [346.5,244.783]],
+];
+const NORMAL_THROW_SIZE = 110;   // near-camera bit size at spawn
+
 function throwPathFor(u){
+  if(NORMAL){
+    const [P0, P1, P2, P3] = [0,1,2,3].map(k => lagPt(u, NORMAL_THROWS.map(a => a[k])));
+    return { P0, P1, P2, P3, size0: NORMAL_THROW_SIZE };
+  }
   const P0 = [ lerp(THROW.spawn.x0, THROW.spawn.x1, u),
                THROW.spawn.yEdge + THROW.spawn.sag * bump(u) ];
   const P1 = lagPt(u, THROW.ctrlSpawn);
@@ -179,12 +237,13 @@ function saveJarState() {
   const arr = [];
   const allGems = [...prefill, ...gems];
   for(const g of allGems) {
-    if (g.position.y < H + GEM) {
+    if (g.position.y < H + GEM && g.plugin.outsideSince === undefined) {   // not one fading out beside the jar
       arr.push({
         c: g.plugin.color,
         x: g.position.x,
         y: g.position.y,
-        ang: g.angle
+        ang: g.angle,
+        v: window.VARIANT,   // positions are canvas px, only valid for the same variant
       });
     }
   }
@@ -260,16 +319,190 @@ function patchGaps(imgs){
 }
 
 let fillImgs = [], strokeImgs = [], gemImgs = [], subImgs = [], donoImgs = [], noteImgs = [];
+let subVideo = null;   // normal variant's sub stinger
+let paperBag = null;   // normal variant's donation stinger (PaperBagStinger, drawn live)
+let donoBuilding = false;   // its receipt is being built: the stinger queue counts that as on screen
+let raidIntroImgs = [], raidClickImgs = [];
+
+/* Animated SVG stingers (the raid bell's Blender exports, the paper-bag donation
+   stinger): every frame is a <g> that a looping SMIL <animate> on `display` shows for
+   1/25s, in file order. Split into one image per frame (SMIL removed, that frame made
+   visible) so the frame player sets the timing — e.g. the bell's intro once, then its
+   click loop once per click. Reads the SVG text, so it needs http(s) like the gem
+   outlines. Returns { imgs, box } — box is the last frame's outline bounds (canvas px). */
+async function loadSvgFrames(url){
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(res.status + ' ' + url);
+  const svg = new DOMParser().parseFromString(await res.text(), 'image/svg+xml').documentElement;
+  const frames = [...svg.querySelectorAll('animate[attributeName="display"]')].map(a => a.parentNode);
+  if(!frames.length) throw new Error('no animated frames in ' + url);
+  frames.forEach((g, i) => g.setAttribute('data-frame', i));
+  svg.querySelectorAll('animate').forEach(a => a.remove());
+  const xml = new XMLSerializer();
+  const single = i => {
+    const one = svg.cloneNode(true);
+    one.querySelectorAll('[data-frame]').forEach(g => {
+      if(+g.getAttribute('data-frame') !== i) g.remove();
+      else g.setAttribute('display', 'inline');   // frames may start hidden (display="none")
+    });
+    return one;
+  };
+  const urls = frames.map((_, i) => 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml.serializeToString(single(i))));
+  // getBBox needs the frame in the document (hidden, zero size)
+  const host = document.body.appendChild(document.importNode(single(frames.length-1), true));
+  host.setAttribute('style', 'position:absolute;width:0;height:0;overflow:hidden');
+  const bb = host.getBBox(); host.remove();
+  return { imgs: patchGaps(await loadList(urls)).filter(Boolean), box: { x: bb.x, y: bb.y, w: bb.width, h: bb.height } };
+}
+
+/* Freestyle exports the bell as strokes only, so each frame gets the tip jar's white
+   fill here: every pixel the outline encloses — the ones the canvas edge can't reach
+   once breaks in the line up to 2*FILL_GAP px are bridged — is painted white under
+   the strokes. The bridge is grown back afterwards, so no white shows outside the line.
+   A visible white patch smaller than FILL_SPECK px is a break or pinhole in the line
+   (Freestyle leaves them where strokes meet), not part of the bell: it's painted black,
+   or it would show as a white dot.
+   ponytail: a break wider than 2*FILL_GAP leaks, and that part of the bell stays
+   unfilled; raise FILL_GAP, or export a fill pass, if the art ever needs it. */
+const FILL_GAP = 3, FILL_SPECK = 40;
+function dilate(m, w, h, r){                       // square max-filter, two separable passes
+  const t = new Uint8Array(m.length), o = new Uint8Array(m.length);
+  for(let y=0; y<h; y++) for(let x=0; x<w; x++){
+    let v = 0; for(let k=Math.max(0,x-r), e=Math.min(w-1,x+r); k<=e && !v; k++) v = m[y*w+k]; t[y*w+x] = v; }
+  for(let y=0; y<h; y++) for(let x=0; x<w; x++){
+    let v = 0; for(let k=Math.max(0,y-r), e=Math.min(h-1,y+r); k<=e && !v; k++) v = t[k*w+x]; o[y*w+x] = v; }
+  return o;
+}
+async function withFill(im){
+  const w = im.width, h = im.height, n = w*h, c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(im, 0, 0, w, h);
+  const a = x.getImageData(0, 0, w, h).data;
+  const ink = new Uint8Array(n);
+  for(let i=0; i<n; i++) ink[i] = a[i*4+3] >= 64;
+  const wall = dilate(ink, w, h, FILL_GAP), out = new Uint8Array(n), stack = [];
+  const reach = i => { if(!wall[i] && !out[i]){ out[i] = 1; stack.push(i); } };
+  for(let X=0; X<w; X++){ reach(X); reach(n-w+X); }
+  for(let Y=0; Y<h; Y++){ reach(Y*w); reach(Y*w+w-1); }
+  while(stack.length){
+    const i = stack.pop(), X = i % w;
+    if(X > 0) reach(i-1); if(X < w-1) reach(i+1); if(i >= w) reach(i-w); if(i < n-w) reach(i+w);
+  }
+  // +2: also past the line's soft outer edge, so the fill's border sits under the stroke
+  const outside = dilate(out, w, h, FILL_GAP + 2), fill = x.createImageData(w, h), d = fill.data;
+  for(let i=0; i<n; i++) if(!outside[i]) d.fill(255, i*4, i*4+4);
+  // visible = filled and not under the line; its small patches are specks -> black
+  const vis = i => !outside[i] && a[i*4+3] < 128, seen = new Uint8Array(n);
+  for(let i=0; i<n; i++){
+    if(seen[i] || !vis(i)) continue;
+    const patch = [i]; seen[i] = 1;
+    for(let k=0; k<patch.length; k++){
+      const j = patch[k], X = j % w;
+      for(const m of [X > 0 ? j-1 : -1, X < w-1 ? j+1 : -1, j >= w ? j-w : -1, j < n-w ? j+w : -1])
+        if(m >= 0 && !seen[m] && vis(m)){ seen[m] = 1; patch.push(m); }
+    }
+    if(patch.length < FILL_SPECK) for(const j of patch) d[j*4] = d[j*4+1] = d[j*4+2] = 0;
+  }
+  x.putImageData(fill, 0, 0);
+  x.drawImage(im, 0, 0, w, h);                     // the strokes over the fill
+  return loadImgOnce(c.toDataURL());              // an image, not a resident canvas (see bakeAssets)
+}
+
+/* Normal raid bell: two filled parts, assembled as in the reference (Group.svg, 325x234
+   including the 8px centred stroke): the button sits BEHIND the body, and each click
+   presses it down and back up over 7 frames. The press follows the compact Blender
+   click (0, 2, 5.7, 7.7, 5.7, 2, 0 px on its 186px-wide bell), scaled to this 316px
+   one — about all the room there is between the button and the dome. The bell is
+   centred on the canvas's bottom edge, as the normal jar is. */
+const NORMAL_BELL = {
+  w: 325, h: 234,                 // assembled size (stroke included)
+  body:   [0, 35.91],             // where each part's SVG sits in the assembly
+  button: [95.96, 0],
+  press:  [0, 3.4, 9.7, 13.1, 9.7, 3.4, 0],   // button offset (px down) per click frame
+};
+async function buildNormalBell(){
+  const [body, button] = await Promise.all([loadImg(RAID_BODY), loadImg(RAID_BUTTON)]);
+  const ox = (W - NORMAL_BELL.w)/2, oy = H - NORMAL_BELL.h;
+  const frame = dy => {
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const x = c.getContext('2d');
+    x.drawImage(button, ox + NORMAL_BELL.button[0], oy + NORMAL_BELL.button[1] + dy);
+    x.drawImage(body, ox + NORMAL_BELL.body[0], oy + NORMAL_BELL.body[1]);
+    return c;   // ~1.4MB each, 7 of them; kept as canvases so it also runs from file://
+  };
+  const clicks = NORMAL_BELL.press.map(frame);
+  return {
+    intro: Array(Math.round(CFG.jarFadeInMs/1000*CFG.fps)).fill(clicks[0]),   // rests while it fades in, like the jar
+    clicks,
+    box: { x: ox + 4, y: oy + 4, w: NORMAL_BELL.w - 8 },   // outline, without the stroke (as getBBox gives compact's)
+  };
+}
+
+/* Gem outline (normal variant, from the v7 prototype): the longest stroked <path>
+   in the gem SVG, sampled to 24 points and rounded with one Chaikin pass, in image
+   px relative to the image centre. makeGem scales it by GEM*CFG.gemBounds. */
+const gemShapes = new Map();   // image -> outline points
+function chaikin(pts){
+  const out = [];
+  for(let i=0; i<pts.length; i++){
+    const a = pts[i], b = pts[(i+1)%pts.length];
+    out.push([a[0]*.75+b[0]*.25, a[1]*.75+b[1]*.25], [a[0]*.25+b[0]*.75, a[1]*.25+b[1]*.75]);
+  }
+  return out;
+}
+function gemOutline(text, im){
+  const src = new DOMParser().parseFromString(text, 'image/svg+xml').querySelector('svg');
+  if(!src) return null;
+  const vb = (src.getAttribute('viewBox') || `0 0 ${im.width} ${im.height}`).trim().split(/[\s,]+/).map(Number);
+  const NS = 'http://www.w3.org/2000/svg', host = document.createElementNS(NS, 'svg');
+  host.setAttribute('viewBox', vb.join(' '));
+  host.setAttribute('style', 'position:absolute;width:0;height:0;overflow:hidden');
+  document.body.appendChild(host);   // getTotalLength needs the path in the document
+  let best = null, bestL = 0;
+  src.querySelectorAll('path').forEach(el=>{
+    if(el.closest('clipPath,defs,pattern,mask')) return;
+    if((el.getAttribute('stroke') || 'none').toLowerCase() === 'none') return;
+    const p = document.createElementNS(NS, 'path'); p.setAttribute('d', el.getAttribute('d') || ''); host.appendChild(p);
+    const L = p.getTotalLength(); if(L > bestL){ bestL = L; best = p; }
+  });
+  let pts = null;
+  if(best){
+    const sx = im.width/vb[2], sy = im.height/vb[3], N = 24; pts = [];
+    for(let i=0; i<N; i++){
+      const q = best.getPointAtLength(bestL*i/N);
+      pts.push([(q.x-vb[0])*sx - im.width/2, (q.y-vb[1])*sy - im.height/2]);
+    }
+    pts = chaikin(pts);
+  }
+  host.remove();
+  return pts;
+}
 
 async function loadAssets(){
   const nTip = collision.frames.length;   // frame count follows collision.js
   const [tipF, tipS, subs, gems, notes] = await Promise.all([
     loadList(Array.from({length:nTip}, (_,i)=>TIP_FILL(i))),
     loadList(Array.from({length:nTip}, (_,i)=>TIP_STROKE(i))),
-    loadList(Array.from({length:CFG.subFrames}, (_,i)=>SUB_FRAME(i))),
+    loadList(NORMAL ? [] : Array.from({length:CFG.subFrames}, (_,i)=>SUB_FRAME(i))),
     loadList(GEM_URLS),
-    loadList(['assets/notes/music-eighth-note.svg', 'assets/notes/music-quaver-note.svg']),
+    loadList(NOTE_URLS),
   ]);
+  if(NORMAL){
+    // the normal sub stinger is one webm (VP9 with alpha), drawn into the stinger canvas
+    subVideo = document.createElement('video');
+    subVideo.muted = true; subVideo.playsInline = true; subVideo.preload = 'auto';
+    subVideo.src = SUB_VIDEO;
+  }
+  // gem bodies follow each sprite's stroke outline, read from the SVG text. Needs
+  // http(s) (GitHub Pages / a local server); if it can't be read, that gem is a circle.
+  await Promise.all(GEM_URLS.map(async (url, i)=>{
+    if(!gems[i]) return;
+    try{
+      const pts = gemOutline(await (await fetch(url)).text(), gems[i]);
+      if(pts) gemShapes.set(gems[i], pts);
+    }catch(err){ console.warn('[assets] no outline for ' + url + ', using a circle: ' + err.message); }
+  }));
   fillImgs   = patchGaps(tipF).filter(Boolean);
   strokeImgs = patchGaps(tipS).filter(Boolean);
   subImgs    = patchGaps(subs).filter(Boolean);
@@ -280,11 +513,34 @@ async function loadAssets(){
   gemImgs = gems.map(im => im || gemFallback).filter(Boolean);
   GEM_COLORS.forEach((c,i)=>{ if(gemImgs[i]) gemByColor[c] = gemImgs[i]; });
 
-  // donation frames are optional — probe until the first missing file
-  for(let i=0; i<100; i++){
-    try{ donoImgs.push(await loadImg(DONO_FRAME(i), 1)); }
-    catch(e){ break; }
+  // donation stinger (paper bag) is optional. compact: Blender frames (they come filled);
+  // normal: drawn in code, its receipt laid out in HTML (fonts, logo and icons embedded)
+  try{
+    if(NORMAL){
+      const font = w => `${DONO_DIR}/fonts/inter-latin-${w}-normal.woff2`;
+      await ReceiptHTML.init({ fonts: { 500: font(500), 600: font(600), 700: font(700) },
+        logo: `${DONO_DIR}/ninos-cafe-logo.svg`, heart: `${DONO_DIR}/heart.svg`,
+        icons: { twitch: `${DONO_DIR}/platforms/twitch.svg`, youtube: `${DONO_DIR}/platforms/youtube.svg` } });
+      paperBag = new PaperBagStinger(document.createElement('canvas'));   // an offscreen layer, see playDonation
+    }
+    else donoImgs = (await loadSvgFrames(DONO_SVG)).imgs;
   }
+  catch(err){ console.warn('[assets] no donation stinger: ' + err.message); }
+
+  // raid bell is optional too
+  try{
+    let box;
+    if(NORMAL) ({ intro: raidIntroImgs, clicks: raidClickImgs, box } = await buildNormalBell());
+    else{
+      const [intro, click] = await Promise.all([loadSvgFrames(RAID_INTRO), loadSvgFrames(RAID_CLICK)]);
+      raidIntroImgs = await Promise.all(intro.imgs.map(withFill));
+      raidClickImgs = await Promise.all(click.imgs.map(withFill));
+      box = intro.box;
+    }
+    const r = overBox(box);   // notes rise from the resting bell's top, spread over its width
+    raidNoteArcs = noteArcs(p => [p[0]*r.s + r.dx, p[1]*r.s + r.dy]);
+  }
+  catch(err){ console.warn('[assets] no raid bell: ' + err.message); }
 
   // the jar can't draw without its own frames; everything else degrades quietly
   if(!fillImgs.length || !strokeImgs.length) throw new Error('tip-jar frames failed to load');
@@ -315,12 +571,14 @@ function bakeAssets(){
   strokeBaked = strokeImgs.map(im => bakeToCanvas(im, W, H));
   // gems: bake at the largest on-screen size (a bit's spawn size in flight) so both
   // the smaller settled gems and the larger flying ones stay crisp when scaled.
-  const gemPx = Math.ceil(Math.max(GEM, THROW.sizeCenter * MAP.s));
+  const gemPx = Math.ceil(Math.max(GEM, NORMAL ? NORMAL_THROW_SIZE : THROW.sizeCenter * MAP.s));
   for(const im of gemImgs){
     const s = gemPx / Math.max(im.width, im.height);
     gemBaked.set(im, bakeToCanvas(im, im.width * s, im.height * s));
   }
-  for(const im of noteImgs) noteBaked.set(im, bakeToCanvas(im, im.width, im.height));
+  // notes grow to NOTE_S*1.26 (drawNotes) — bake at that so they're never upscaled
+  const noteK = Math.max(1, NOTE_S * 1.26);
+  for(const im of noteImgs) noteBaked.set(im, bakeToCanvas(im, im.width * noteK, im.height * noteK));
 }
 
 /* =========================================================================
@@ -483,8 +741,10 @@ function applyT(T, p){
    ========================================================================= */
 let engine, walls=[], gems=[], prefill=[], flights=[], throwQueue=[], throwTimer=null;
 let debug=false, gemDebug=false, arcDebug=false;
-let playhead=0, playing=true, lastT=null, firstWallFrame=0, introHidden=true;
+let playhead=0, playing=true, lastT=null, firstWallFrame=0, introHidden=true, introMs=0;
 let jarState = 'IDLE'; // IDLE, INTRO, PLAYING, OUTRO
+// the jar fades in over this; compact over its first 3 fall frames (same as before)
+const JAR_FADE_IN_MS = NORMAL ? CFG.jarFadeInMs : 3/CFG.fps*1000;
 let outroT = 0;
 let lastWallKey = null; // skips rebuilding the static physics walls every frame once settled
 let physicsAcc = 0;     // real-time physics accumulator (keeps gems at correct speed below 60fps)
@@ -494,10 +754,21 @@ const LAST = ()=>fillImgs.length-1;
 function makeGem(x, y, im){
   im = im || gemImgs[Math.floor(Math.random()*gemImgs.length)];
   const scale = GEM/Math.max(im.width, im.height);
-  const r = GEM*0.5*(1-OVERLAP);
-  const b = Bodies.circle(x, y, r, {...LIVE, friction:0.02, frictionStatic:0.05,
-                                    density:0.002, angle:Math.random()*Math.PI});
-  b.plugin = { im, scale, r };
+  const opts = {...LIVE, friction:0.02, frictionStatic:0.05, density:0.002};
+  const shape = gemShapes.get(im);
+  let b, off = [0, 0];
+  if(shape){
+    // body sits at the outline's centroid; off maps it back to the sprite centre
+    const k = scale*BODY, verts = shape.map(p=>({x:p[0]*k, y:p[1]*k}));
+    const c = Matter.Vertices.centre(verts);
+    b = Bodies.fromVertices(x, y, [verts], opts);   // no poly-decomp: a concave outline becomes its hull
+    Body.setPosition(b, {x, y});
+    off = [c.x, c.y];
+  } else {
+    b = Bodies.circle(x, y, GEM*0.5*BODY, opts);
+  }
+  Body.setAngle(b, Math.random()*Math.PI);
+  b.plugin = { im, scale, off };
   return b;
 }
 
@@ -512,7 +783,7 @@ function computeJarCapacity(){
     minX=Math.min(minX,pt[0]); maxX=Math.max(maxX,pt[0]);
     minY=Math.min(minY,pt[1]); maxY=Math.max(maxY,pt[1]);
   }
-  const eff = GEM*(1-OVERLAP);
+  const eff = GEM*BODY;
   const cells = ((maxX-minX)-eff*0.5) * ((maxY-minY)-eff*0.5) / (eff*eff);
   return Math.max(4, Math.min(CFG.maxJarGems, Math.floor(cells*0.9)));
 }
@@ -540,7 +811,12 @@ function boot(overridePrefillN = null){
   engine.positionIterations = 16;
   engine.velocityIterations = 14;
 
-  // ground collision removed so gems fall off screen immediately
+  // compact: no ground, so gems fall off screen immediately. normal (v7): a ground
+  // slab at groundY, so a missed gem lands beside the jar and fades (cullEscaped)
+  if(NORMAL && collision.meta.groundY != null){
+    Composite.add(engine.world, Bodies.rectangle(W/2, collision.meta.groundY*H + 20, W*4, 40,
+      { isStatic:true, friction:.6, restitution:.05 }));
+  }
 
   firstWallFrame = 0;
   for(let i=0; i<collision.frames.length; i++){ if(pairsRaw(i).length){ firstWallFrame=i; break; } }
@@ -555,9 +831,11 @@ function boot(overridePrefillN = null){
   for(let i=0; i<prefillGems.length; i++){
     const data = prefillGems[i];
     let im = data.c ? gemByColor[data.c] : null;
-    let x = (data.x !== undefined) ? data.x : W*0.38 + Math.random()*W*0.24;
-    let y = (data.y !== undefined) ? data.y : H*0.45 - i*GEM*0.45;
-    let ang = data.ang !== undefined ? data.ang : Math.random()*Math.PI;
+    // saved positions only fit the variant that saved them (old saves are compact)
+    const here = data.x !== undefined && (data.v || 'compact') === window.VARIANT;
+    let x = here ? data.x : W*0.38 + Math.random()*W*0.24;
+    let y = here ? data.y : H*0.45 - i*GEM*0.45;
+    let ang = here && data.ang !== undefined ? data.ang : Math.random()*Math.PI;
     
     const g = makeGem(x, y, im);
     Body.setAngle(g, ang);
@@ -573,7 +851,7 @@ function boot(overridePrefillN = null){
   for(let i=0; i<400; i++) Engine.update(engine, 1000/60);
   captureAndFreeze(prefill);
 
-  playhead=0; playing=true; introHidden=true; lastT=null;
+  playhead=0; playing=true; introHidden=true; lastT=null; introMs=0;
   jarState = 'INTRO';
   idleTime = 0;
   lastWallKey = null;   // force a wall rebuild for the new run
@@ -595,13 +873,12 @@ function unfreezeInto(t){
   }
 }
 function positionWalls(pairs){
-  // the physics circle is (1-OVERLAP) of the sprite, so gems could visually poke
-  // ~GEM*OVERLAP/2 through the art — inset every wall toward the jar interior
-  // by exactly that slop so sprites stay inside the drawn walls
+  // each wall body fills the band between its drawn line and WALL_T inside it (v7):
+  // its collision face is moved WALL_T toward the jar interior
   let ccx=0, ccy=0, cn=0;
   for(const [p,q] of pairs){ ccx+=p[0]+q[0]; ccy+=p[1]+q[1]; cn+=2; }
   if(cn){ ccx/=cn; ccy/=cn; }
-  const inset = (GEM*0.5*OVERLAP) + 8;
+  const inset = WALL_T;
   for(let i=0; i<walls.length; i++){
     if(i >= pairs.length){ Body.setPosition(walls[i],{x:-2000,y:-2000}); continue; }
     let [[x1,y1],[x2,y2]] = pairs[i];
@@ -669,22 +946,21 @@ function removeGem(g){
   if(idx >= 0) gems.splice(idx, 1);
 }
 
+// The fused gem takes the place of the lowest gem it was made from: that spot was
+// just vacated, so it doesn't spawn inside the pile (or a wall) and kick gems out.
+// Built from its own sprite, so a normal-variant gem gets its own outline body.
+function fuseInto(batch, color){
+  const low = batch.reduce((a,b)=> b.position.y > a.position.y ? b : a);
+  const x = low.position.x, y = low.position.y;
+  for(const g of batch) removeGem(g);
+  const ng = makeGem(x, y, gemByColor[color]);
+  ng.plugin.color = color;
+  gems.push(ng); Composite.add(engine.world, ng);
+}
+
 function mergeBottomGems(){
   let needed = (prefill.length + gems.length) - JAR_CAP;
   if(needed <= 0) return;
-
-  // find the lowest point in the jar (highest Y among wall pairs) for placing merged gems
-  const pairs = pairsRaw(LAST());
-  let bottomY = H * 0.7;
-  let bottomX = W * 0.5;
-  if(pairs.length){
-    let maxY = -Infinity;
-    for(const [p,q] of pairs){
-      for(const pt of [p,q]){
-        if(pt[1] > maxY){ maxY = pt[1]; bottomX = pt[0]; bottomY = pt[1] - GEM*0.5; }
-      }
-    }
-  }
 
   // 1. Try strict merging: pick any gems of the right color from anywhere in the jar
   for(const rule of CFG.mergeUp){
@@ -695,16 +971,7 @@ function mergeBottomGems(){
       if(matches.length < rule.count) break;   // not enough to merge
 
       // pick the first `count` (any, not position-dependent)
-      const batch = matches.slice(0, rule.count);
-      for(const g of batch) removeGem(g);
-
-      // spawn the upgraded gem near the bottom of the jar
-      const ng = makeGem(bottomX + (Math.random()-0.5)*GEM, bottomY);
-      ng.plugin.color = rule.to;
-      ng.plugin.im = gemByColor[rule.to];
-      ng.plugin.scale = GEM / Math.max(ng.plugin.im.width, ng.plugin.im.height);
-      gems.push(ng); Composite.add(engine.world, ng);
-
+      fuseInto(matches.slice(0, rule.count), rule.to);
       needed -= (rule.count - 1);
     }
   }
@@ -733,21 +1000,7 @@ function mergeBottomGems(){
     
     let bestTier = Math.min(tier1, tier2);
     let nextTier = Math.max(0, bestTier - 1);
-    let newColor = GEM_COLORS[nextTier];
-
-    // Spawn the new gem at the position of whichever fused gem was lowest in the jar
-    let spawnX = g1.position.y > g2.position.y ? g1.position.x : g2.position.x;
-    let spawnY = g1.position.y > g2.position.y ? g1.position.y : g2.position.y;
-
-    removeGem(g1);
-    removeGem(g2);
-
-    const ng = makeGem(spawnX, spawnY);
-    ng.plugin.color = newColor;
-    ng.plugin.im = gemByColor[newColor];
-    ng.plugin.scale = GEM / Math.max(ng.plugin.im.width, ng.plugin.im.height);
-    gems.push(ng); Composite.add(engine.world, ng);
-
+    fuseInto([g1, g2], GEM_COLORS[nextTier]);
     needed -= 1;
   }
 
@@ -765,6 +1018,7 @@ function mergeBottomGems(){
 }
 
 // gems that bounce out land on the ground, rest a moment, then fade away
+const OUTSIDE_X = NORMAL ? [0.2, 0.8] : [0.235, 0.765];   // jar's left / right edge, fraction of W
 function cullEscaped(now){
   for(const list of [prefill, gems]){
     for(let i=list.length-1; i>=0; i--){
@@ -772,7 +1026,7 @@ function cullEscaped(now){
       if(p.y > H+GEM || p.x < -GEM || p.x > W+GEM){        // fell off the world
         Composite.remove(engine.world, g); list.splice(i,1); continue;
       }
-      const outside = p.y > H*0.6 && (p.x < W*0.235 || p.x > W*0.765);
+      const outside = p.y > H*0.6 && (p.x < W*OUTSIDE_X[0] || p.x > W*OUTSIDE_X[1]);
       if(!outside){ delete g.plugin.outsideSince; g.plugin.alpha = 1; continue; }
       if(g.plugin.outsideSince === undefined) g.plugin.outsideSince = now;
       const fadeIn = now - g.plugin.outsideSince - (CFG.outsideTTLMs - CFG.outsideFadeMs);
@@ -783,15 +1037,16 @@ function cullEscaped(now){
 }
 
 /* ---------------- music notes (middle plane, one at a time) ---------------- */
-let activeNotes = [], noteOnRight = false;
-function spawnNote(){
-  if(!noteImgs.length) return;
-  
+let activeNotes = [], raidNotes = [], noteOnRight = false;   // jar's notes / the raid bell's
+const NOTE_S = MAP.s * (NORMAL ? CFG.noteScale : 1);   // note sprite scale (before the 1.26 grow)
+function spawnNote(list = activeNotes, arcs = NOTE_ARCS){
+  if(!noteImgs.length || !arcs) return;
+
   const now = performance.now();
-  
+
   // If there is already a note playing, check how far along it is
-  if (activeNotes.length > 0) {
-    const lastNote = activeNotes[activeNotes.length - 1];
+  if (list.length > 0) {
+    const lastNote = list[list.length - 1];
     const t = (now - lastNote.start) / lastNote.dur;
     
     // If the newest note hasn't reached our "almost done" point (e.g., 60%), don't spawn a new one
@@ -799,36 +1054,36 @@ function spawnNote(){
   }
 
   noteOnRight = !noteOnRight;
-  activeNotes.push({
+  list.push({
     im: noteImgs[Math.random() < 0.75 ? 0 : 1],   // 75% eighth, 25% quaver
-    arc: noteOnRight ? NOTE_ARCS.right : NOTE_ARCS.left,
+    arc: noteOnRight ? arcs.right : arcs.left,
     dir: noteOnRight ? 1 : -1,
     start: now,
     dur: CFG.noteDurationMs,
   });
 }
 
-function drawNotes(ctx, now){
+function drawNotes(ctx, now, list = activeNotes){
   // Loop backward to safely remove notes that have fully finished their arc
-  for(let i = activeNotes.length - 1; i >= 0; i--) {
-    const n = activeNotes[i];
+  for(let i = list.length - 1; i >= 0; i--) {
+    const n = list[i];
     const t = (now - n.start) / n.dur;
-    
-    if(t >= 1){ 
-      activeNotes.splice(i, 1); // Note is 100% done, remove from array
+
+    if(t >= 1){
+      list.splice(i, 1); // Note is 100% done, remove from array
       continue; 
     }
     
     const e = 1-(1-t)*(1-t);                        // ease-out along the arc
     const p = cubic(n.arc, e);
-    const scale = MAP.s * lerp(1, 1.26, e);         // grows toward the camera
+    const scale = NOTE_S * lerp(1, 1.26, e);        // grows toward the camera
     const rot = n.dir * e * 4 * Math.PI/180;        // slight outward tilt
     const alpha = Math.min(1, t/0.12) * (1 - smooth(Math.max(0, (t-0.7)/0.3)));
     
     ctx.save();
     ctx.globalAlpha *= alpha;
     ctx.translate(p[0], p[1]); ctx.rotate(rot); ctx.scale(scale, scale);
-    ctx.drawImage(noteBaked.get(n.im) || n.im, -n.im.width/2, -n.im.height/2);
+    ctx.drawImage(noteBaked.get(n.im) || n.im, -n.im.width/2, -n.im.height/2, n.im.width, n.im.height);
     ctx.restore();
   }
 }
@@ -950,12 +1205,12 @@ function cheer(bits){
 }
 
 function drawGem(ctx, g){
-  const { im, scale } = g.plugin;
+  const { im, scale, off } = g.plugin;
   const src = gemBaked.get(im) || im;   // baked raster (falls back to the svg pre-bake)
   ctx.save();
   if(g.plugin.alpha !== undefined) ctx.globalAlpha *= g.plugin.alpha;
   ctx.translate(g.position.x, g.position.y); ctx.rotate(g.angle);
-  ctx.drawImage(src, -im.width*scale/2, -im.height*scale/2, im.width*scale, im.height*scale);
+  ctx.drawImage(src, -off[0]-im.width*scale/2, -off[1]-im.height*scale/2, im.width*scale, im.height*scale);
   ctx.restore();
 }
 function drawFlight(ctx, fl, now){
@@ -972,6 +1227,7 @@ function drawFlight(ctx, fl, now){
 
 /* ---------------- main loop ---------------- */
 function loop(ts){
+  pumpStingerQueue(performance.now());   // start the next queued stinger once the screen is clear
   if (jarState === 'IDLE') {
     lastT = ts;
     const ctx = $('jarCv').getContext('2d');
@@ -1001,11 +1257,14 @@ function loop(ts){
     // tab hidden), the intro pauses instead of teleporting to the end with
     // the gems left hanging mid-air
     playhead = Math.min(playhead + Math.min(dt, 100)/1000*CFG.fps, LAST());
+    introMs += Math.min(dt, 100);
     if(introHidden && playhead >= firstWallFrame){
       introHidden = false;
       unfreezeInto(playhead);
     }
-    if(playhead >= LAST()){
+    // the intro ends with the jar's last frame, and not before it has faded in
+    // (normal has one frame, so its intro is just the fade)
+    if(playhead >= LAST() && introMs >= JAR_FADE_IN_MS){
       playing = false;
       jarState = 'PLAYING';
       pumpThrowQueue();
@@ -1081,7 +1340,7 @@ function loop(ts){
   if (jarState === 'OUTRO') {
     alpha = 1 - Math.min(1, outroT / CFG.fadeOutMs);
   } else {
-    alpha = playing && playhead <= 3 ? playhead/3 : 1;
+    alpha = playing ? Math.min(1, introMs / JAR_FADE_IN_MS) : 1;
   }
   const fillImg = fillBaked[fi] || fillImgs[fi], strokeImg = strokeBaked[fi] || strokeImgs[fi];
 
@@ -1125,6 +1384,15 @@ function loop(ts){
     lx.clip('evenodd');
     lx.drawImage(strokeImg, 0, 0, W, H);
     lx.restore();
+  } else if(NORMAL){
+    // normal has no separate stroke art: the whole jar again, multiplied. Its white
+    // fill leaves the gems untouched and its black stroke lands on top of them —
+    // the same picture as v7's fill/stroke split, with no split files.
+    // ponytail: only exact for black-on-white art; a coloured jar needs fill/ +
+    // stroke/ exports like compact (and the clip passes above).
+    lx.globalCompositeOperation = 'multiply';
+    lx.drawImage(strokeImg, 0, 0, W, H);
+    lx.globalCompositeOperation = 'source-over';
   } else {
     lx.drawImage(strokeImg, 0, 0, W, H);
   }
@@ -1137,6 +1405,8 @@ function loop(ts){
   ctx.globalAlpha = 1;
 
   if(debug){
+    ctx.fillStyle='rgba(58,123,255,.25)';   // the wall bodies themselves, WALL_T thick
+    for(const w of walls){ ctx.beginPath(); clipToCorners(ctx, w.vertices.map(v=>[v.x, v.y])); ctx.fill(); }
     ctx.strokeStyle='#3a7bff'; ctx.lineWidth=2;
     ctx.beginPath();
     for(const [p,q] of pairsAt(playing ? playhead : LAST())){ ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); }
@@ -1145,8 +1415,8 @@ function loop(ts){
   }
   if(gemDebug){
     ctx.strokeStyle='#00b34d'; ctx.lineWidth=2;
-    for(const g of [...prefill, ...gems]){
-      ctx.beginPath(); ctx.arc(g.position.x, g.position.y, g.plugin.r, 0, Math.PI*2); ctx.stroke();
+    for(const g of [...prefill, ...gems]){   // the body itself (Matter circles are polygons too)
+      ctx.beginPath(); clipToCorners(ctx, g.vertices.map(v=>[v.x, v.y])); ctx.stroke();
     }
   }
   if(arcDebug){
@@ -1173,50 +1443,179 @@ function loop(ts){
    ========================================================================= */
 const stingerCv = ()=>$('stingerCv');
 let stingerBusy = false;         // a sub/dono sequence is on screen
-let framePlay = null;            // { imgs, type, t0 }
+let framePlay = null;            // { imgs | video | live, type, t0, endAt?, failed? }
 
-function playFrames(imgs, type){
-  if(!imgs.length || stingerBusy) return;
+// src: an array of frame images/canvases (25fps), a <video> (the normal sub stinger), or
+// a live one { ms, draw(ms) -> canvas } that paints its own frame (the normal paper bag)
+function playFrames(src, type, fadeInMs = CFG.subFadeInMs){
+  const video = src instanceof HTMLVideoElement ? src : null, live = src.draw ? src : null;
+  if(!(video || live || src.length) || stingerBusy) return;
   stingerBusy = true;
   const cv = stingerCv();
-  cv.width = imgs[0].width; cv.height = imgs[0].height;
+  cv.width  = video ? (video.videoWidth  || W) : live ? W : src[0].width;
+  cv.height = video ? (video.videoHeight || H) : live ? H : src[0].height;
   cv.style.display = 'block';
-  framePlay = { imgs, type, t0: performance.now() };
+  const fp = framePlay = { imgs: video || live ? null : src, video, live, type, fadeInMs, t0: performance.now() };
+  if(video){
+    video.currentTime = 0;
+    // a video that can't play must still end, or stingerBusy would block every later sub
+    video.play().catch(err => { console.warn('[stinger] sub video: ' + err.message); fp.failed = true; });
+  }
 }
-function playSub(){ playFrames(subImgs, 'sub'); }
-function playDonation(){
-  if(!donoImgs.length){
-    console.warn('[stinger] donation-stinger frames not found — add assets/donation-stinger/donation-stinger.00.svg …');
+function playSub(){ playFrames(subVideo || subImgs, 'sub'); }
+
+// What the HUD / D key play. d (from Streamer.bot, see connectStreamerbot):
+// { name, amount, message, platform: 'twitch'|'youtube', avatar?: url, at: when the event came in }
+const DEMO_DONATION = { name: 'ALongDisplayName_ForTheReceipt', amount: '$20.00', platform: 'twitch',
+  message: 'Keep up the great streams, this one is for the coffee fund!' };
+
+async function playDonation(d = DEMO_DONATION){
+  if(!NORMAL){
+    if(!donoImgs.length){ console.warn('[stinger] donation stinger not found — add ' + DONO_SVG); return; }
+    return playFrames(donoImgs, 'dono');   // fades in and out like the sub stinger
+  }
+  if(!paperBag){ console.warn('[stinger] donation stinger not loaded — see the [assets] warning'); return; }
+  if(stingerBusy || donoBuilding) return;  // one stinger at a time (playFrames would drop it anyway)
+  donoBuilding = true;
+
+  // the receipt: the donor's colour and avatar, given until DONOR_WAIT_MS after the event
+  const left = Math.max(0, (d.at ?? performance.now()) + DONOR_WAIT_MS - performance.now());
+  const [color, avatar] = await Promise.all(donorLookups(d).map(p => Promise.race([p, sleep(left).then(() => null)])));
+  const anon = isAnonymous(d.name);
+  let tex = null, sim = null;
+  try{
+    tex = await ReceiptHTML.build({ ...d, platform: anon ? null : d.platform, avatar,
+      color: usernameCardColor(color || (d.platform === 'youtube' ? '#FF0000' : '#9146FF')) });
+    sim = new ReceiptSim(paperBag.track(), d, { stroke: paperBag.o.stroke, texture: tex, ...paperBag.o.receipt });
+  }catch(err){ console.warn('[stinger] no receipt, the bag plays alone: ' + err.message); }
+  donoBuilding = false;
+
+  // drawn at full opacity on the bag's own canvas; the frame player fades that as one picture
+  const bag = paperBag, last = Math.ceil(bag.o.duration * 60);   // the bag runs at 60fps
+  playFrames({ ms: last / 60 * 1000, draw(ms){
+    const f = Math.min(last, Math.floor(ms / 1000 * 60)), x = bag.ctx;
+    x.setTransform(bag.dpr, 0, 0, bag.dpr, 0, 0); x.clearRect(0, 0, bag.o.size, bag.o.size);
+    bag.drawBag(bag.state(f / 60));
+    if(sim){ sim.step(f); sim.draw(x); }
+    return bag.canvas;
+  } }, 'dono');
+}
+
+/* The donor on the normal receipt, found the way the chat box finds them for its cards:
+   Twitch name colour = the colour they chat in (learnt from chat, else ivr.fi), then
+   tamed for white paper; YouTube = red; avatar from decapi.me, else a dicebear face.
+   Cached per name, and started as the event comes in (connectStreamerbot), so they've
+   had the chat's fade to arrive before the receipt is built.
+   ponytail: a lookup slower than DONOR_WAIT_MS leaves the receipt without the avatar
+   (and the name in the platform colour); raise it if that happens often — every ms past
+   the chat's fade makes the bag start that much late. */
+const DONOR_WAIT_MS = 800;
+const isAnonymous = name => !name || /^anonymous$/i.test(name);
+const twitchColors = new Map(), colorFetches = new Map(), avatarFetches = new Map();
+function rememberTwitchColor(color, ...keys){
+  if(typeof color !== 'string' || !color.startsWith('#')) return;
+  keys.forEach(k => { if(k) twitchColors.set(String(k).toLowerCase(), color); });
+}
+function donorColor(d){
+  const login = String(d.name || '').toLowerCase();
+  if(d.platform !== 'twitch' || isAnonymous(login)) return Promise.resolve(null);
+  if(twitchColors.has(login)) return Promise.resolve(twitchColors.get(login));
+  if(!colorFetches.has(login)) colorFetches.set(login,
+    fetch('https://api.ivr.fi/v2/twitch/user?login=' + encodeURIComponent(login))
+      .then(r => r.ok ? r.json() : null).then(j => (Array.isArray(j) && j[0] && j[0].chatColor) || null).catch(() => null));
+  return colorFetches.get(login);
+}
+function donorAvatar(d){
+  const name = d.name, key = d.platform + ':' + name;   // a Twitch and a YouTube "Bob" are different people
+  if(!avatarFetches.has(key)) avatarFetches.set(key, (async () => {
+    let url = d.avatar;
+    if(!url && d.platform === 'twitch'){
+      try{ const r = await fetch('https://decapi.me/twitch/avatar/' + encodeURIComponent(name)); const t = r.ok ? (await r.text()).trim() : '';
+           if(t.startsWith('http')) url = t; }catch(e){}
+    }
+    url = url || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(name)}&backgroundColor=b6e3f4,c0aede,d1d4f9`;
+    const data = await ReceiptHTML.toDataURL(url).catch(() => null);   // the host must allow CORS (Twitch's CDN does)
+    if(!data) avatarFetches.delete(key);                                // try again next time
+    return data;
+  })());
+  return avatarFetches.get(key);
+}
+// [colour, avatar] promises; starting them twice reuses the first
+const donorLookups = d => [donorColor(d), isAnonymous(d.name) ? Promise.resolve(null) : donorAvatar(d)];
+
+// The chat box's username colours (its script.js tameUsernameColor / usernameCardColor,
+// for a name with no outline, as on the receipt): a name too light for white paper is
+// taken down to 3:1, a near-black one lifted a little. Keep in step with the chat box.
+function tameUsernameColor(color, maxLum, minLum){
+  if(!color || !color.startsWith('#')) return color;
+  let h = color.slice(1); if(h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  const [r, g, b] = [0, 2, 4].map(i => parseInt(h.slice(i, i+2), 16));
+  const lin = c => { const s = c/255; return s <= 0.03928 ? s/12.92 : Math.pow((s+0.055)/1.055, 2.4); };
+  const lum = (r, g, b) => 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b);
+  const L = lum(r, g, b);
+  if(L > maxLum){
+    let f = 1; while(lum(r*f, g*f, b*f) > maxLum && f > 0.05) f -= 0.02;
+    return `rgb(${Math.round(r*f)}, ${Math.round(g*f)}, ${Math.round(b*f)})`;
+  }
+  if(L < minLum){
+    let t = 0; while(lum(r+(255-r)*t, g+(255-g)*t, b+(255-b)*t) < minLum && t < 0.95) t += 0.02;
+    return `rgb(${Math.round(r+(255-r)*t)}, ${Math.round(g+(255-g)*t)}, ${Math.round(b+(255-b)*t)})`;
+  }
+  return color;
+}
+function usernameCardColor(color){
+  const onWhite = tameUsernameColor(color, 0.30, 0);
+  return onWhite === color ? tameUsernameColor(color, 0.30, 0.04) : onWhite;
+}
+// the bell's intro (normal: resting while it fades in, like the jar), a short rest on
+// its last frame, then its click loop once per raider: 1-10 viewers click that many
+// times, more than that clicks CFG.raidMaxClicks times
+function playRaid(viewers){
+  if(!raidIntroImgs.length || !raidClickImgs.length){
+    console.warn('[stinger] raid bell art not found — add ' + (NORMAL ? RAID_BODY + ' and ' + RAID_BUTTON : RAID_INTRO + ' and ' + RAID_CLICK));
     return;
   }
-  playFrames(donoImgs, 'dono');
+  const rest = Array(CFG.raidPauseFrames).fill(raidIntroImgs[raidIntroImgs.length - 1]);
+  const n = raidClicks(viewers), clicks = Array.from({length: n}, () => raidClickImgs).flat();
+  playFrames([...raidIntroImgs, ...rest, ...clicks], 'raid', NORMAL ? CFG.jarFadeInMs : CFG.subFadeInMs);
+  // a music note per click (as the jar gives one per landing), on CFG.raidNoteFrame of each
+  const first = raidIntroImgs.length + rest.length + CFG.raidNoteFrame;
+  if(framePlay && framePlay.type === 'raid' && !framePlay.noteFrames)   // not if another stinger was busy
+    framePlay.noteFrames = Array.from({length: n}, (_, k) => first + k*raidClickImgs.length);
 }
+const raidClicks = viewers => Math.min(CFG.raidMaxClicks, Math.max(1, Math.floor(viewers) || 1));
 
 // Advance + draw the active sub/dono frame. Called once per frame by loop().
 function renderFramePlayer(now){
   if(!framePlay) return;
-  const { imgs, t0 } = framePlay;
+  const { imgs, video, live, t0 } = framePlay;
   const cv = stingerCv(), ctx = cv.getContext('2d');
   const elapsed = now - t0;
-  const totalDuration = imgs.length / CFG.fps * 1000;
+  const ended = video ? (video.ended || !!video.error || framePlay.failed)
+              : live  ? elapsed >= live.ms
+                      : elapsed >= imgs.length / CFG.fps * 1000;
+  if (ended && framePlay.endAt === undefined) framePlay.endAt = now;
 
-  let alpha = 1, fi = Math.floor(elapsed/1000*CFG.fps), isFinished = false;
-  if (elapsed >= totalDuration) {
-    fi = imgs.length - 1;                       // hold the last frame
-    const post = elapsed - totalDuration;
-    if (post >= CFG.waitBeforeFadeMs) {
-      const fo = post - CFG.waitBeforeFadeMs;
-      if (fo < CFG.fadeOutMs) alpha = 1 - fo/CFG.fadeOutMs;   // real outro fade
-      else { alpha = 0; isFinished = true; }
-    }
+  let alpha = 1, isFinished = false;
+  if (ended) {                                  // hold the last frame (a video stays on it)
+    const fo = now - framePlay.endAt - CFG.waitBeforeFadeMs;
+    if (fo >= CFG.fadeOutMs) isFinished = true;
+    else if (fo > 0) alpha = 1 - fo/CFG.fadeOutMs;             // real outro fade
   }
-  if (elapsed < CFG.subFadeInMs) alpha = Math.min(alpha, elapsed / CFG.subFadeInMs);  // ease in
+  if (elapsed < framePlay.fadeInMs) alpha = Math.min(alpha, elapsed / framePlay.fadeInMs);  // ease in
 
-  if (isFinished) { ctx.clearRect(0,0,cv.width,cv.height); cv.style.display = 'none'; framePlay = null; stingerBusy = false; return; }
+  if (isFinished) { ctx.clearRect(0,0,cv.width,cv.height); cv.style.display = 'none'; framePlay = null; stingerBusy = false; raidNotes.length = 0; return; }
+
+  const fi = imgs && Math.min(imgs.length-1, Math.floor(elapsed/1000*CFG.fps));
+  if (framePlay.noteFrames) {                   // raid bell: a note on each click (frames can be skipped)
+    for (const f of framePlay.noteFrames) if (f > (framePlay.lastFi ?? -1) && f <= fi) spawnNote(raidNotes, raidNoteArcs);
+    framePlay.lastFi = fi;
+  }
 
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.globalAlpha = alpha;
-  ctx.drawImage(imgs[fi], 0, 0);
+  drawNotes(ctx, now, raidNotes);               // behind the bell, as the jar's are behind its front stroke
+  ctx.drawImage(video || (live ? live.draw(elapsed) : imgs[fi]), 0, 0, cv.width, cv.height);
   ctx.globalAlpha = 1;
 }
 
@@ -1227,7 +1626,8 @@ window.stinger = {
   cheer,                           // stinger.cheer(1234) — cheered amount -> tiered gems
   throwBits,                       // stinger.throwBits(5, 'red'?) — raw throws (color optional)
   playSub,                         // stinger.playSub()
-  playDonation,                    // stinger.playDonation()
+  playDonation,                    // stinger.playDonation({ name, amount, message, platform }?) — no data: a demo receipt
+  playRaid,                        // stinger.playRaid(viewers) — raid bell, one click per raider (max 10)
   replayIntro: ()=>boot(Math.min(savedGems.length, computeJarCapacity())),
   setBits: n => { setBitCount(n); boot(Math.min(n, computeJarCapacity())); },
   resetBits: ()=> { setBitCount(0); boot(0); },
@@ -1259,15 +1659,28 @@ const STINGER_SYNC = {
   // --- tip-jar timing model (mirrors CFG in this file) so the overlay can predict
   //     a cheer's length from the bit amount. Keep in step with CFG if you retune. ---
   fps:            25,   // CFG.fps
-  jarIntroFrames: 36,   // collision.frames.length — the jar-rise intro
+  // compact: collision.frames.length, the jar falls in; normal: JAR_FADE_IN_MS (400ms) of frames
+  jarIntroFrames: { compact: 36, normal: 10 },
   throwStaggerMs: 170,  // CFG.throwStaggerMs — gap between queued throws
   throwFlightMs:  780,  // CFG.throwDurationMs — a gem's flight time
   noteTailMs:     850,  // CFG.noteDurationMs — the last note lingers after the last landing
   jarIdleMs:      800,  // CFG.waitBeforeFadeMs — idle the jar/sub holds before it fades out
   maxThrows:      40,   // CFG.maxQueuedThrows — the jar clamps a cheer to this many
-  subFrames:      65,   // sub-stinger frame count (subImgs.length)
+  subFrames:      { compact: 65, normal: 147 },   // compact: subImgs.length; normal: the 5.88s webm
+  // raid bell: intro frames, then the click loop once per raider (max raidMaxClicks).
+  // compact: the Blender intro; normal: the 400ms fade-in on the resting bell
+  raidIntroFrames: { compact: 35, normal: 10 },  // raidIntroImgs.length
+  raidClickFrames: { compact: 7,  normal: 7 },   // raidClickImgs.length
+  raidMaxClicks:  10,   // CFG.raidMaxClicks
+  raidPauseFrames: 8,   // CFG.raidPauseFrames — rest between the intro and the first click
+  // donation stinger (paper bag). compact: donoImgs.length; normal: the live bag's 2.4s
+  // (PaperBagStinger's duration) in 25fps frames
+  donoFrames:     { compact: 53, normal: 60 },
   marginMs:       250,  // small pad so the chat's card lands as the stinger clears, not before
+  fadeOutMs:      400,  // CFG.fadeOutMs — a stinger's own fade out; the next queued one waits for it
 };
+// the chat's copy picks this from its own size (receipt = normal); here it's the variant
+const stingerSize = () => NORMAL ? 'normal' : 'compact';
 
 // How many gems a cheer throws — mirrors CFG.bitTiers decomposition (biggest tier
 // first, one gem per full tier amount, remainder flows down), clamped like the jar.
@@ -1285,26 +1698,52 @@ function stingerContentMs(kind, data){
   const S = STINGER_SYNC;
   if(kind === 'cheer'){
     const n = stingerCheerThrows(data && data.bits);
-    const introMs  = S.jarIntroFrames / S.fps * 1000;                  // jar rises
+    const introMs  = S.jarIntroFrames[stingerSize()] / S.fps * 1000;   // jar falls in / fades in
     const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs;      // launch all + last flight
     return Math.round(introMs + throwsMs + S.noteTailMs + S.jarIdleMs + S.marginMs);
   }
+  if(kind === 'raid'){
+    // bell intro, then one click per raider (1-10 viewers -> that many, more -> max)
+    const clicks = Math.min(S.raidMaxClicks, Math.max(1, Math.floor(data && data.viewers) || 1));
+    const frames = S.raidIntroFrames[stingerSize()] + S.raidPauseFrames + clicks * S.raidClickFrames[stingerSize()];
+    return Math.round(frames / S.fps * 1000 + S.jarIdleMs + S.marginMs);
+  }
+  // donation / tip — the paper bag plays, then holds jarIdleMs, then fades
+  if(kind === 'dono') return Math.round(S.donoFrames[stingerSize()] / S.fps * 1000 + S.jarIdleMs + S.marginMs);
   // sub / resub / gift / bomb — frames play, then hold jarIdleMs, then fade
-  return Math.round(S.subFrames / S.fps * 1000 + S.jarIdleMs + S.marginMs);
+  return Math.round(S.subFrames[stingerSize()] / S.fps * 1000 + S.jarIdleMs + S.marginMs);
 }
 
-// Route a Streamer.bot event to the stinger. The jar/sub own their own fades, so we
-// only delay the trigger by chatFadeMs (let the chat fade out first) and collapse a
-// gift-sub bomb into a single sub.
-let subQueued = false;
-function triggerStinger(kind, effect){
-  if(kind === 'sub'){
-    if(subQueued || stingerBusy) return;                                // one sub at a time
-    subQueued = true;
-    setTimeout(() => { subQueued = false; effect(); }, STINGER_SYNC.chatFadeMs);
-  } else {
-    setTimeout(effect, STINGER_SYNC.chatFadeMs);                        // the jar queues multiple cheers itself
-  }
+// The stinger queue — identical to the chat box's copy. Both sources run it on the same
+// events at the same moment, so they agree on when every stinger plays without talking:
+// a stinger starts once the chat has faded out and the one before it has fully faded
+// away, so they play one after another and never overlap. A sub that lands while a sub
+// stinger is still coming or on screen is part of that burst (a gift bomb) and adds no
+// stinger. Returns { start, contentMs } (performance.now() ms), or null for such a sub.
+let stingerQueueEnd = 0, stingerSubEnd = 0;   // when the last stinger / last sub stinger is gone
+function stingerSchedule(kind, data) {
+  const S = STINGER_SYNC, now = performance.now();
+  if (kind === 'sub' && now < stingerSubEnd) return null;
+  const contentMs = stingerContentMs(kind, data);
+  const start = Math.max(now + S.chatFadeMs, stingerQueueEnd);
+  stingerQueueEnd = start + contentMs - S.marginMs + S.fadeOutMs;
+  if (kind === 'sub') stingerSubEnd = stingerQueueEnd;
+  return { start, contentMs };
+}
+
+// Route a Streamer.bot event to the stinger: queue its effect for its scheduled start.
+// pumpStingerQueue (every frame, from loop) plays it then, and never while another
+// stinger is still on screen — the jar included — so a late one waits rather than overlaps.
+const stingerQueue = [];   // { start, effect }, in order
+function triggerStinger(kind, effect, data){
+  const slot = stingerSchedule(kind, data);
+  if(slot) stingerQueue.push({ start: slot.start, effect });
+}
+function pumpStingerQueue(now){
+  const next = stingerQueue[0];
+  if(!next || now < next.start || stingerBusy || donoBuilding || jarState !== 'IDLE') return;
+  stingerQueue.shift();
+  next.effect();
 }
 
 // The label at the bottom (the chat box's): NOT CONNECTED until Streamer.bot connects,
@@ -1328,12 +1767,16 @@ function setConnectionStatus(connected){
    to the Streamer.bot WebSocket server running on the same machine as OBS
    (default 127.0.0.1:8080), auto-reconnects, and maps events to the stinger.
 
-   OBS browser source: just point it at the deployed index.html at 400x400.
+   OBS browser source: just point it at the deployed index.html at 400x400
+   (compact) or 596x596 (normal).
    Optional URL params (all have sensible defaults):
+     ?variant=compact|normal   force a variant instead of picking it by size
      ?address=127.0.0.1   Streamer.bot host
      ?port=8080           Streamer.bot WebSocket port
      ?showCheers=false    disable the cheer -> tip-jar reaction
-     ?showSubs=false      disable the sub/resub/giftsub -> sub stinger
+     ?showSubs=false      disable the sub/resub/giftsub + YouTube membership/gifted -> sub stinger
+     ?showRaids=false     disable the raid -> raid bell
+     ?showDonations=false disable the Streamlabs donation / StreamElements tip / Super Chat -> paper bag
    ========================================================================= */
 function connectStreamerbot(){
   const p = new URLSearchParams(location.search);
@@ -1346,6 +1789,8 @@ function connectStreamerbot(){
   const port       = p.get('port')    || '8080';
   const showCheers = boolParam('showCheers', true);
   const showSubs   = boolParam('showSubs', true);
+  const showRaids  = boolParam('showRaids', true);
+  const showDonations = boolParam('showDonations', true);
 
   if(typeof StreamerbotClient === 'undefined'){
     console.warn('[stinger] @streamerbot/client not loaded — running in manual/HUD mode only');
@@ -1364,11 +1809,11 @@ function connectStreamerbot(){
     client.on('Twitch.Cheer', ({ data }) => {
       const bits = Number(data?.bits ?? data?.message?.bits ?? 0);
       console.log('[stinger] Twitch.Cheer received — bits:', bits);
-      if(bits > 0) triggerStinger('cheer', () => stinger.cheer(bits));
+      if(bits > 0) triggerStinger('cheer', () => stinger.cheer(bits), { bits });
     });
   }
 
-  // Sub / Resub / Gift sub -> full-screen sub stinger (donation stinger untouched).
+  // Sub / Resub / Gift sub, and YouTube's memberships -> full-screen sub stinger.
   // A gift-sub bomb fires many GiftSub events; triggerStinger collapses them into one.
   if(showSubs){
     const onSub = (name) => () => {
@@ -1378,6 +1823,36 @@ function connectStreamerbot(){
     client.on('Twitch.Sub',     onSub('Twitch.Sub'));
     client.on('Twitch.ReSub',   onSub('Twitch.ReSub'));
     client.on('Twitch.GiftSub', onSub('Twitch.GiftSub'));
+    client.on('YouTube.NewSponsor',     onSub('YouTube.NewSponsor'));       // new member
+    client.on('YouTube.MembershipGift', onSub('YouTube.MembershipGift'));   // gifted memberships
+  }
+
+  // Raid -> the raid bell, one click per raider (the chat box reads the same data.viewers)
+  if(showRaids){
+    client.on('Twitch.Raid', ({ data }) => {
+      const viewers = Number(data?.viewers ?? 0);
+      console.log('[stinger] Twitch.Raid received — viewers:', viewers);
+      triggerStinger('raid', () => stinger.playRaid(viewers), { viewers });
+    });
+  }
+
+  // Donation / tip / Super Chat -> the paper-bag donation stinger (cheers stay with the tip
+  // jar). The receipt reads the payload as the chat box's card does (a Twitch user,
+  // Streamlabs' formatted amount / StreamElements' $amount; a Super Chat's own user and amount).
+  if(showDonations){
+    const onDono = (name, receipt) => ({ data = {} }) => {
+      console.log('[stinger] ' + name + ' received → donation stinger');
+      const d = { platform: 'twitch', message: data.message, ...receipt(data), at: performance.now() };
+      if(NORMAL) donorLookups(d);   // colour + avatar start now, while the chat fades
+      triggerStinger('dono', () => stinger.playDonation(d));
+    };
+    client.on('Streamlabs.Donation', onDono('Streamlabs.Donation', x => ({ name: x.from, amount: x.formattedAmount })));
+    client.on('StreamElements.Tip',  onDono('StreamElements.Tip',  x => ({ name: x.username, amount: x.formattedAmount || `$${x.amount}` })));
+    client.on('YouTube.SuperChat',   onDono('YouTube.SuperChat',   x => ({ name: x.user?.name || 'YouTube Fan', amount: x.amount,
+      platform: 'youtube', avatar: x.user?.profileImageUrl })));
+    // the receipt's name colour: every chatter's colour as it goes by, as the chat box keeps them
+    if(NORMAL) client.on('Twitch.ChatMessage', ({ data }) => rememberTwitchColor(data?.message?.color,
+      data?.message?.userId, data?.message?.username, data?.message?.displayName, data?.user?.id, data?.user?.login, data?.user?.name));
   }
 
   // Empty the tip jar at the start of each stream. Streamer.bot fires StreamOnline
@@ -1401,6 +1876,7 @@ function wireHud(){
   $('cheerBtn').onclick   = ()=>cheer(parseInt($('cheerAmt').value, 10) || 0);
   $('subBtn').onclick     = ()=>playSub();
   $('donoBtn').onclick    = ()=>playDonation();
+  $('raidBtn').onclick    = ()=>playRaid(parseInt($('raidAmt').value, 10) || 1);
   $('replayBtn').onclick  = ()=>stinger.replayIntro();
   $('demoBtn').onclick    = ()=>stinger.setBits(CFG.defaultBits);
   $('resetBtn').onclick   = ()=>stinger.resetBits();
@@ -1416,6 +1892,7 @@ function wireHud(){
       case 'y': throwBits(10); break;
       case 's': playSub(); break;
       case 'd': playDonation(); break;
+      case 'b': playRaid(5); break;
       case 'r': stinger.replayIntro(); break;
     }
   });

@@ -24,6 +24,10 @@
   </span>
   <button class="btn" id="subBtn">Sub stinger</button>
   <button class="btn" id="donoBtn">Donation stinger</button>
+  <span class="group">
+    <input class="num" id="raidAmt" type="number" value="5" min="1" step="1">
+    <button class="btn" id="raidBtn">Raid</button>
+  </span>
   <button class="btn" id="replayBtn">Replay intro</button>
   <button class="btn" id="demoBtn">Demo fill</button>
   <button class="btn" id="resetBtn">Reset bits</button>
@@ -34,8 +38,18 @@
 </div>
 
 <script src="assets/vendor/matter.min.js"></script>
-<script src="assets/collision.js?v=2"></script>
+<script>
+  // Variant from the browser-source size: 400x400 -> compact, 596x596 -> normal.
+  // ?variant=compact|normal overrides it (handy for testing in a full browser window).
+  window.VARIANT = ['compact', 'normal'].includes(new URLSearchParams(location.search).get('variant'))
+    ? new URLSearchParams(location.search).get('variant')
+    : (Math.min(innerWidth, innerHeight) >= 500 ? 'normal' : 'compact');
+  document.write('<script src="assets/' + VARIANT + '/tip-jar-stinger/collision.js?v=3"><\/script>');
+  // normal's donation stinger is drawn in code: the paper bag and the receipt taped to it
+  if (VARIANT === 'normal') ['receipt-physics', 'receipt-html', 'paperbag-stinger'].forEach(f =>
+    document.write('<script src="assets/normal/donation-stinger/' + f + '.js?v=1"><\/script>'));
+</script>
 <script type="text/javascript" src="https://unpkg.com/@streamerbot/client/dist/streamerbot-client.js"></script>
-<script src="script.js?v=3"></script>
+<script src="script.js?v=5"></script>
 </body>
 </html>
