@@ -1,6 +1,7 @@
 /* paperbag-stinger.js
    The donation paper bag stinger, drawn fully in code at 60 fps: the bag hops, falls, lands,
-   squashes and turns into the crumpled bag, then rocks and settles. The normal variant has the
+   squashes and turns into the crumpled bag with its top pressed down (Figma's Group 6), then
+   rocks and settles. The normal variant has the
    live receipt (receipt-physics.js) taped on; the compact variant is the bag alone.
 
    Load receipt-physics.js (and receipt-html.js for the HTML receipt) before this file.
@@ -11,24 +12,37 @@
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const ease = t => t * t * (3 - 2 * t);
 
-  /* ---------- bag shapes from Figma, in Group 5's coordinates (Group 4 sits 5.5 px further left) ---------- */
-  const TOP = 'M431.508 4H9.5L19.5 92.646H421.508L431.508 4Z';
+  /* ---------- bag shapes from Figma, in Group 5's coordinates (Group 4 sits 5.5 px further left) ----------
+     On landing the bag morphs from the clean standing bag (Group 4's straight tapered sides) into
+     the landed one: Group 6, crumpled with its top pressed down. Group 6 is drawn in its own frame
+     and is 16.855 px shorter, so it's moved down by that much (LANDED_DY): both bags stand on the
+     same floor and only the top comes down. Its bottom lands within 0.1 px of BOTTOM, so that's shared. */
+  const LANDED_DY = 514.855 - 498;
+  const down = pts => pts.map(([x, y]) => [x, y + LANDED_DY]);
   const BOTTOM = 'L431.508 479.386C431.508 488.793 427.771 497.815 421.119 504.466C414.468 511.118 405.446 514.855 396.039 514.855H44.969C35.562 514.855 26.5404 511.118 19.8886 504.466C13.2369 497.815 9.5 488.793 9.5 479.386';
-  // side points: right side at y 218 / 319.5 / 411.5, left side at y 197 / 297 / 400.5
-  // clean = on the straight tapered sides of Group 4, crumpled = Group 5
   const side = (x0, x1, y) => x0 + (x1 - x0) * (y - 92.646) / (479.386 - 92.646);
-  const CLEAN = { r: [218, 319.5, 411.5].map(y => side(421.508, 431.508, y)), l: [197, 297, 400.5].map(y => side(19.5, 9.5, y)) };
-  const CRUMPLED = { r: [429, 426, 439], l: [9, 14.5, 4] };
-  const body = k => {
-    const r = i => lerp(CLEAN.r[i], CRUMPLED.r[i], k), l = i => lerp(CLEAN.l[i], CRUMPLED.l[i], k);
-    return `M19.5 92.646H421.508L${r(0)} 218L${r(1)} 319.5L${r(2)} 411.5${BOTTOM}L${l(2)} 400.5L${l(1)} 297L${l(0)} 197Z`;
+  const STANDING = {
+    band: [[431.508, 4], [9.5, 4], [19.5, 92.646], [421.508, 92.646]],      // the folded top
+    top: 92.646,                                                           // where the body starts under it
+    r: [218, 319.5, 411.5].map(y => [side(421.508, 431.508, y), y]),       // right side, top to bottom
+    l: [197, 297, 400.5].map(y => [side(19.5, 9.5, y), y]),                // left side, top to bottom
   };
-  const CREASES = [
-    [[49.5, 338], [82.9, 283.2], [68, 236.5]],
-    [[345, 385], [370.3, 338.4], [401.5, 358]],
-    [[58, 421.5], [83, 447.5]],
-    [[179.5, 468], [233.4, 421.6], [294, 447.5]],
-  ];
+  const LANDED = {                                                         // Group 6
+    band: down([[431, 4], [9, 4], [18.9998, 76.8525], [421, 76.8525]]),
+    top: 76.8525 + LANDED_DY,
+    r: down([[429, 201.891], [426, 303.136], [439, 394.905]]),
+    l: down([[9, 180.944], [14.5, 280.693], [4, 383.933]]),
+  };
+  const at = (key, k) => STANDING[key].map((p, i) => [lerp(p[0], LANDED[key][i][0], k), lerp(p[1], LANDED[key][i][1], k)]);
+  const lines = pts => pts.map(([x, y]) => `L${x} ${y}`).join('');
+  const band = k => { const [a, ...rest] = at('band', k); return `M${a[0]} ${a[1]}${lines(rest)}Z`; };
+  const body = k => `M19.5 ${lerp(STANDING.top, LANDED.top, k)}H421.508${lines(at('r', k))}${BOTTOM}${lines(at('l', k).reverse())}Z`;
+  const CREASES = [                                                        // Group 6's
+    [[49, 321.357], [82.3804, 266.664], [67.5, 220.062]],
+    [[344.5, 368.262], [369.743, 321.831], [401, 341.317]],
+    [[57.5, 404.689], [82.5, 430.636]],
+    [[179, 451.095], [232.764, 404.892], [293.5, 430.636]],
+  ].map(down);
   const PIVOT = { x: 220.504, y: 514.855 };       // bottom centre of the bag
   const BAG_W = 422;
 
@@ -115,7 +129,7 @@
       const ctx = this.ctx, m = this.matrix(st), o = this.o;
       const shape = d => { const p = new Path2D(); p.addPath(new Path2D(d), m); return p; };   // transform the shape, not the stroke
       ctx.lineWidth = o.stroke; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.strokeStyle = '#000'; ctx.fillStyle = '#fff';
-      for (const d of [body(st.crumple), TOP]) { const p = shape(d); ctx.fill(p); ctx.stroke(p); }
+      for (const d of [body(st.crumple), band(st.crumple)]) { const p = shape(d); ctx.fill(p); ctx.stroke(p); }
       if (st.crease > 0) {                                              // crease lines draw on after the landing
         ctx.beginPath();
         for (const line of CREASES) {

@@ -1690,6 +1690,7 @@ const STINGER_SYNC = {
   donoFrames:     { compact: 53, normal: 60 },
   marginMs:       250,  // small pad so the chat's card lands as the stinger clears, not before
   fadeOutMs:      400,  // CFG.fadeOutMs — a stinger's own fade out; the next queued one waits for it
+  cardHoldMs:     2000, // between queued stingers: the chat is back showing the last one's card this long
 };
 // the chat's copy picks this from its own size (receipt = normal); here it's the variant
 const stingerSize = () => NORMAL ? 'normal' : 'compact';
@@ -1727,19 +1728,21 @@ function stingerContentMs(kind, data){
 }
 
 // The stinger queue — identical to the chat box's copy. Both sources run it on the same
-// events at the same moment, so they agree on when every stinger plays without talking:
-// a stinger starts once the chat has faded out and the one before it has fully faded
-// away, so they play one after another and never overlap. A sub that lands while a sub
-// stinger is still coming or on screen is part of that burst (a gift bomb) and adds no
-// stinger. Returns { start, contentMs } (performance.now() ms), or null for such a sub.
-let stingerQueueEnd = 0, stingerSubEnd = 0;   // when the last stinger / last sub stinger is gone
+// events at the same moment, so they agree on when every stinger plays without talking.
+// Each stinger gets a turn of its own: the chat fades out, the stinger plays, the chat
+// comes back with that event's card and holds it cardHoldMs, and only then does the
+// chat fade out for the next one, so stingers never overlap and each card follows its
+// own stinger. A sub that lands while a sub stinger is still coming or on screen is
+// part of that burst (a gift bomb) and adds no stinger. Returns { start, contentMs }
+// (performance.now() ms), or null for such a sub.
+let stingerQueueEnd = 0, stingerSubEnd = 0;   // when the next stinger may start / the last sub stinger is gone
 function stingerSchedule(kind, data) {
   const S = STINGER_SYNC, now = performance.now();
   if (kind === 'sub' && now < stingerSubEnd) return null;
   const contentMs = stingerContentMs(kind, data);
   const start = Math.max(now + S.chatFadeMs, stingerQueueEnd);
-  stingerQueueEnd = start + contentMs - S.marginMs + S.fadeOutMs;
-  if (kind === 'sub') stingerSubEnd = stingerQueueEnd;
+  stingerQueueEnd = start + contentMs + S.chatFadeMs + S.cardHoldMs + S.chatFadeMs;   // chat back, card, chat out
+  if (kind === 'sub') stingerSubEnd = start + contentMs - S.marginMs + S.fadeOutMs;
   return { start, contentMs };
 }
 
