@@ -1446,14 +1446,15 @@ let stingerBusy = false;         // a sub/dono sequence is on screen
 let framePlay = null;            // { imgs | video | live, type, t0, endAt?, failed? }
 
 // src: an array of frame images/canvases (25fps), a <video> (the normal sub stinger), or
-// a live one { ms, draw(ms) -> canvas } that paints its own frame (the normal paper bag)
+// a live one { ms, scale, draw(ms) -> canvas } that paints its own frame (the normal paper
+// bag) at `scale` device px per px — the canvas gets that many, so it's shown 1:1, not resampled
 function playFrames(src, type, fadeInMs = CFG.subFadeInMs){
   const video = src instanceof HTMLVideoElement ? src : null, live = src.draw ? src : null;
   if(!(video || live || src.length) || stingerBusy) return;
   stingerBusy = true;
   const cv = stingerCv();
-  cv.width  = video ? (video.videoWidth  || W) : live ? W : src[0].width;
-  cv.height = video ? (video.videoHeight || H) : live ? H : src[0].height;
+  cv.width  = video ? (video.videoWidth  || W) : live ? W * live.scale : src[0].width;
+  cv.height = video ? (video.videoHeight || H) : live ? H * live.scale : src[0].height;
   cv.style.display = 'block';
   const fp = framePlay = { imgs: video || live ? null : src, video, live, type, fadeInMs, t0: performance.now() };
   if(video){
@@ -1482,21 +1483,32 @@ async function playDonation(d = DEMO_DONATION){
   const left = Math.max(0, (d.at ?? performance.now()) + DONOR_WAIT_MS - performance.now());
   const [color, avatar] = await Promise.all(donorLookups(d).map(p => Promise.race([p, sleep(left).then(() => null)])));
   const anon = isAnonymous(d.name);
+  // The receipt is rendered at the bag canvas's own pixel density (1 in OBS) and, below,
+  // put down on whole pixels, so once the bag lands its text is copied 1:1 — exactly as
+  // the HTML laid it out — instead of resampled (it rested at y 203.4 from a 2x texture,
+  // which smeared every line across two pixel rows).
+  const bag = paperBag, R = bag.dpr;
   let tex = null, sim = null;
   try{
     tex = await ReceiptHTML.build({ ...d, platform: anon ? null : d.platform, avatar,
-      color: usernameCardColor(color || (d.platform === 'youtube' ? '#FF0000' : '#9146FF')) });
-    sim = new ReceiptSim(paperBag.track(), d, { stroke: paperBag.o.stroke, texture: tex, ...paperBag.o.receipt });
+      color: usernameCardColor(color || (d.platform === 'youtube' ? '#FF0000' : '#9146FF')) }, R);
+    sim = new ReceiptSim(bag.track(), d, { stroke: bag.o.stroke, texture: tex, ...bag.o.receipt, resolution: R });
   }catch(err){ console.warn('[stinger] no receipt, the bag plays alone: ' + err.message); }
   donoBuilding = false;
 
   // drawn at full opacity on the bag's own canvas; the frame player fades that as one picture
-  const bag = paperBag, last = Math.ceil(bag.o.duration * 60);   // the bag runs at 60fps
-  playFrames({ ms: last / 60 * 1000, draw(ms){
+  const last = Math.ceil(bag.o.duration * 60);   // the bag runs at 60fps
+  const onPixel = v => Math.round(v * R) / R;
+  playFrames({ ms: last / 60 * 1000, scale: R, draw(ms){
     const f = Math.min(last, Math.floor(ms / 1000 * 60)), x = bag.ctx;
-    x.setTransform(bag.dpr, 0, 0, bag.dpr, 0, 0); x.clearRect(0, 0, bag.o.size, bag.o.size);
+    x.setTransform(R, 0, 0, R, 0, 0); x.clearRect(0, 0, bag.o.size, bag.o.size);
     bag.drawBag(bag.state(f / 60));
-    if(sim){ sim.step(f); sim.draw(x); }
+    if(sim){
+      sim.step(f);
+      const a = sim.anchor(f), left = a.x - a.hw;   // the receipt's left edge and top, onto whole pixels
+      x.translate(onPixel(left) - left, onPixel(a.y) - a.y);
+      sim.draw(x);
+    }
     return bag.canvas;
   } }, 'dono');
 }
